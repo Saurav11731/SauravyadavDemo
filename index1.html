@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Application</title>
+    <style>
+        #video-player {
+            width: 640px;
+            height: 360px;
+        }
+        
+        #video-call {
+            margin-top: 20px;
+        }
+        
+        video {
+            width: 300px;
+            height: 200px;
+        }
+    </style>
+</head>
+
+<body>
+    <video id="video-player" controls>
+        <source src="video.mp4" type="video/mp4">
+        Your browser does not support the video tag.
+    </video>
+    <p>Points: <span id="points">0</span></p>
+
+    <div id="video-call">
+        <video id="local-video" autoplay></video>
+        <video id="remote-video" autoplay></video>
+        <button id="start-call">Start Call</button>
+        <button id="end-call">End Call</button>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const videoPlayer = document.getElementById('video-player');
+        const pointsDisplay = document.getElementById('points');
+        const userId = 'user123'; // Example user ID
+
+        videoPlayer.addEventListener('ended', () => {
+            fetch('/api/watch-video', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        userId
+                    })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    pointsDisplay.textContent = data.points;
+                });
+        });
+
+        let tapCount = 0;
+        let tapTimeout;
+
+        videoPlayer.addEventListener('click', (event) => {
+            tapCount++;
+            clearTimeout(tapTimeout);
+
+            tapTimeout = setTimeout(() => {
+                if (tapCount === 1) {
+                    if (videoPlayer.paused) {
+                        videoPlayer.play();
+                    } else {
+                        videoPlayer.pause();
+                    }
+                } else if (tapCount === 2) {
+                    const rect = videoPlayer.getBoundingClientRect();
+                    const x = event.clientX - rect.left;
+
+                    if (x > rect.width / 2) {
+                        videoPlayer.currentTime += 10;
+                    } else {
+                        videoPlayer.currentTime -= 10;
+                    }
+                } else if (tapCount === 3) {
+                    const rect = videoPlayer.getBoundingClientRect();
+                    const x = event.clientX - rect.left;
+
+                    if (x > rect.width / 2) {
+                        window.close();
+                    } else if (x < rect.width / 2) {
+                        alert('Showing comments');
+                    } else {
+                        alert('Playing next video');
+                    }
+                }
+
+                tapCount = 0;
+            }, 300);
+        });
+
+        let holdTimeout;
+
+        videoPlayer.addEventListener('mousedown', (event) => {
+            const rect = videoPlayer.getBoundingClientRect();
+            const x = event.clientX - rect.left;
+
+            holdTimeout = setTimeout(() => {
+                if (x > rect.width / 2) {
+                    videoPlayer.playbackRate = 2.0;
+                } else {
+                    videoPlayer.playbackRate = 0.5;
+                }
+            }, 500);
+        });
+
+        videoPlayer.addEventListener('mouseup', () => {
+            clearTimeout(holdTimeout);
+            videoPlayer.playbackRate = 1.0;
+        });
+
+        const socket = io();
+        const localVideo = document.getElementById('local-video');
+        const remoteVideo = document.getElementById('remote-video');
+        const startCallButton = document.getElementById('start-call');
+        const endCallButton = document.getElementById('end-call');
+
+        let localStream;
+        let remoteStream;
+        let peerConnection;
+        const servers = {
+            iceServers: [{
+                urls: 'stun:stun.l.google.com:19302'
+            }]
+        };
+
+        function checkCallAvailability() {
+            const currentHour = new Date().getHours();
+            return (currentHour >= 18 && currentHour <= 23);
+        }
+
+        startCallButton.addEventListener('click', async() => {
+            if (!checkCallAvailability()) {
+                alert('Video calls are allowed only between 6 PM and 12 AM.');
+                return;
+            }
+
+            localStream = await navigator.mediaDevices.getUserMedia({
+                video: true,
+                audio: true
+            });
+            localVideo.srcObject = localStream;
+
+            peerConnection = new RTCPeerConnection(servers);
+            localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+
+            peerConnection.ontrack = event => {
+                if (!remoteStream) {
+                    remoteStream = new MediaStream();
+                    remoteVideo.srcObject = remoteStream;
+                }
+                remoteStream.addTrack(event.track);
+            };
+
+            peerConnection.onicecandidate = event => {
+                if (event.candidate) {
+                    socket.emit('ice-candidate', event.candidate);
+                }
+            };
+
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+            socket.emit('offer', offer);
+        });
+
+        socket.on('offer', async(offer) => {
+            if (!peerConnection) {
+                peerConnection = new RTCPeerConnection(servers);
+                localStream.getTracks().forEach(track => peerConnection.addTrack(track, localStream));
+
+                peerConnection.ontrack = event => {
+                    if (!remoteStream) {
+                        remoteStream = new MediaStream();
+                        remoteVideo.srcObject = remoteStream;
+                    }
+                    remoteStream.addTrack(event.track);
+                };
+
+                peerConnection.onicecandidate = event => {
+                    if (event.candidate) {
+                        socket.emit('ice-candidate', event.candidate);
+                    }
+                };
+            }
+
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+            const answer = await peerConnection.createAnswer();
+            await peerConnection.setLocalDescription(answer);
+            socket.emit('answer', answer);
+        });
+
+        socket.on('answer', (answer) => {
+            peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+        });
+
+        socket.on('ice-candidate', (candidate) => {
+            const iceCandidate = new RTCIceCandidate(candidate);
+            peerConnection.addIceCandidate(iceCandidate);
+        });
+
+        endCallButton.addEventListener('click', () => {
+            peerConnection.close();
+            peerConnection = null;
+            remoteVideo.srcObject = null;
+            localVideo.srcObject = null;
+        });
+    </script>
+</body>
+
+</html>
